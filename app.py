@@ -129,8 +129,33 @@ def http_get(url: str, **kw) -> requests.Response:
 # =========================
 # Google Sheets helpers
 # =========================
-def open_sheet(creds_json: str, sheet_ref: str, worksheet_name: str):
-    creds = ServiceAccountCredentials.from_json_keyfile_name(creds_json, SCOPES)
+def _has_streamlit_secrets_creds() -> bool:
+    try:
+        return bool(st.secrets.get("google_service_account"))
+    except Exception:
+        return False
+
+
+def open_sheet(creds_json_path: str, sheet_ref: str, worksheet_name: str):
+    """
+    Opens a Google Sheet + worksheet.
+    Credentials source:
+      - If creds_json_path is an existing file -> use it
+      - Else -> use Streamlit secrets: st.secrets["google_service_account"]
+    """
+    if creds_json_path and os.path.isfile(creds_json_path):
+        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_json_path, SCOPES)
+    else:
+        if not _has_streamlit_secrets_creds():
+            raise RuntimeError(
+                "No credentials found. Upload a service account JSON, set GOOGLE_CREDS_JSON env var, "
+                "or add [google_service_account] to Streamlit secrets."
+            )
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            st.secrets["google_service_account"],
+            SCOPES
+        )
+
     gc = gspread.authorize(creds)
 
     try:
@@ -143,17 +168,17 @@ def open_sheet(creds_json: str, sheet_ref: str, worksheet_name: str):
     except SpreadsheetNotFound:
         raise RuntimeError(f"Could not find spreadsheet: {sheet_ref}")
 
-    # NEW: open worksheet by name; create it if missing
+    # Worksheet/tab: open by name; create if missing
     worksheet_name = (worksheet_name or "").strip() or "Sheet1"
     try:
         ws = sh.worksheet(worksheet_name)
     except Exception:
-        # Create worksheet if it doesn't exist
         ws = sh.add_worksheet(title=worksheet_name, rows=2000, cols=10)
 
     header = ws.get("A1:D1")
     if not header:
         ws.append_row(["Title", "URL", "Date", "Site"])
+
     return ws
 
 
@@ -166,7 +191,6 @@ def append_rows_batched(ws, rows: List[List[str]], batch_size: int = 200, max_re
                 ws.append_rows(chunk, value_input_option="RAW")
                 break
             except Exception as e:
-                # exponential backoff: 1s, 2s, 4s, 8s...
                 wait = min(60, 2 ** (attempt - 1))
                 print(f"[warn] append_rows failed (batch {i//batch_size + 1}, attempt {attempt}/{max_retries}): {e}")
                 time.sleep(wait)
@@ -205,7 +229,6 @@ def get_category_id(api_base: str, slug: Optional[str]) -> Optional[int]:
     try:
         data = r.json()
     except ValueError:
-        # Not JSON; fall back to no category filter
         return None
     return data[0]["id"] if data else None
 
@@ -229,7 +252,6 @@ def fetch_wp_posts(api_base: str, cat_id: Optional[int], target_date: datetime.d
         try:
             posts = r.json()
         except ValueError:
-            # Non-JSON response → bail for this site/day
             break
 
         if not posts:
@@ -257,7 +279,6 @@ def fetch_fc_posts(api_base: str, target_date: datetime.date) -> List[Tuple[str,
         try:
             posts = r.json()
         except ValueError:
-            # Non-JSON (block page, etc.) → stop for this day
             break
 
         if not posts:
@@ -299,7 +320,7 @@ def scrape_boombd(target_date: datetime.date) -> List[Tuple[str, str, str]]:
                 continue
             seen.add(link)
             title = a.get_text(strip=True)
-            # date near the h4
+
             sib = h4.next_sibling
             date_str = None
             while sib:
@@ -308,6 +329,7 @@ def scrape_boombd(target_date: datetime.date) -> List[Tuple[str, str, str]]:
                     date_str = text.split("|", 1)[1].strip()
                     break
                 sib = sib.next_sibling
+
             if not date_str:
                 try:
                     pr = http_get(link)
@@ -317,18 +339,23 @@ def scrape_boombd(target_date: datetime.date) -> List[Tuple[str, str, str]]:
                         date_str = t.get("datetime") or t.get_text(strip=True)
                 except Exception:
                     date_str = None
+
             if not date_str:
                 continue
+
             try:
                 art_date = dateparser.parse(date_str, tzinfos=TZINFOS).date()
             except Exception:
                 continue
+
             if art_date < target_date:
                 stop = True
                 break
+
             if art_date == target_date:
                 rows.append((title, link, art_date.isoformat()))
                 page_has_any = True
+
         if stop:
             break
         if not page_has_any and page > 3:
@@ -410,8 +437,6 @@ def scrape_ajker(target_date: datetime.date) -> List[Tuple[str, str, str]]:
                 continue
 
             ps = BeautifulSoup(pr.text, "html.parser")
-
-            # ✅ read publish date from "প্রকাশ : ..."
             art_date = _parse_ajk_publish_date(ps)
             if not art_date:
                 continue
@@ -439,8 +464,6 @@ def scrape_ajker(target_date: datetime.date) -> List[Tuple[str, str, str]]:
 # The Dissent HTML helpers  (FIXED)
 # =========================
 
-import re
-
 # Bangla digits & months
 BN_DIGITS = {
     "০": "0",
@@ -455,7 +478,6 @@ BN_DIGITS = {
     "৯": "9",
 }
 
-# Month variants seen across Bangla sites (including spelling variants like "ফেব্রুয়ারী")
 BN_MONTHS = {
     "জানুয়ারি": 1, "জানুয়ারী": 1,
     "ফেব্রুয়ারি": 2, "ফেব্রুয়ারী": 2,
@@ -471,25 +493,18 @@ BN_MONTHS = {
     "ডিসেম্বর": 12,
 }
 
-# Matches strings like: "৩ ফেব্রুয়ারী, ২০২৬" or "৯ নভেম্বর, ২০২৫"
 _BN_DATE_RE = re.compile(r"([০-৯]{1,2})\s+([^\s,]+)\s*,\s*([০-৯]{4})")
 
 
 def parse_bangla_date(text: str) -> Optional[datetime.date]:
-    """
-    Parse a Bangla date like '৯ নভেম্বর, ২০২৫' into datetime.date(2025, 11, 9).
-    Accepts small formatting variations.
-    """
     if not text:
         return None
 
     text = str(text).strip()
-    text = re.sub(r"\s+", " ", text)  # normalize whitespace
+    text = re.sub(r"\s+", " ", text)
 
-    # Prefer regex extraction (more robust than split())
     m = _BN_DATE_RE.search(text)
     if not m:
-        # fallback to original split-based parsing if regex fails
         parts = text.replace(",", "").split()
         if len(parts) != 3:
             return None
@@ -518,7 +533,6 @@ def dissent_api_get(page: int, per_page: int = 50) -> dict:
         "per_page": per_page,
         "published": "true",
     }
-    # Use JSON:API Accept header
     r = SESSION.get(
         DISSENT_API_BASE,
         params=params,
@@ -543,10 +557,6 @@ def dissent_fetch_article_html(url: str) -> str:
 
 
 def dissent_extract_bangla_title(soup: BeautifulSoup) -> Optional[str]:
-    """
-    Extract Bangla title from article page.
-    Prefer <h1>, or first heading with Bangla chars.
-    """
     h1 = soup.find("h1")
     if h1:
         txt = h1.get_text(strip=True)
@@ -561,15 +571,6 @@ def dissent_extract_bangla_title(soup: BeautifulSoup) -> Optional[str]:
 
 
 def dissent_extract_date(soup: BeautifulSoup) -> Optional[datetime.date]:
-    """
-    Robust extraction for The Dissent BN pages.
-
-    Old approach relied on a div class like "_date_*", which is fragile.
-    New approach:
-      1) Look near the H1 header region for any Bangla date string.
-      2) If not found, scan the whole page text for a Bangla date string.
-    """
-
     def find_date_in_text(text: str) -> Optional[datetime.date]:
         if not text:
             return None
@@ -581,29 +582,22 @@ def dissent_extract_date(soup: BeautifulSoup) -> Optional[datetime.date]:
 
     h1 = soup.find("h1")
     if h1:
-        # Check the closest reasonable container (usually header area)
         container = h1.parent or soup
         header_text = container.get_text(" ", strip=True)
         d = find_date_in_text(header_text)
         if d:
             return d
 
-        # Also check a limited number of following elements (date sometimes appears after title)
         for elem in list(h1.next_elements)[:250]:
             if isinstance(elem, Tag):
                 d = find_date_in_text(elem.get_text(" ", strip=True))
                 if d:
                     return d
 
-    # Fallback: scan whole document
     return find_date_in_text(soup.get_text(" ", strip=True))
 
 
 def dissent_fetch_for_date(target_date: datetime.date) -> List[Tuple[str, str, str]]:
-    """
-    Fetch The Dissent BN fact-checks whose Bangla date equals target_date.
-    Returns list of (title, url, iso_date).
-    """
     results: List[Tuple[str, str, str]] = []
     page = 1
     MAX_PAGES = 50
@@ -635,7 +629,6 @@ def dissent_fetch_for_date(target_date: datetime.date) -> List[Tuple[str, str, s
             art_date = dissent_extract_date(soup)
             if not art_date:
                 continue
-
             if art_date != target_date:
                 continue
 
@@ -654,7 +647,7 @@ def run_scrape_core(
     start_date: datetime.date,
     end_date: datetime.date,
     sheet_ref: str,
-    worksheet_name: str,  # NEW
+    worksheet_name: str,
     creds_path: str,
     include_wp: List[bool],
     include_fc: bool,
@@ -663,17 +656,19 @@ def run_scrape_core(
     include_dissent: bool,
     log_fn,
 ):
-    # Basic validation
     if end_date < start_date:
         log_fn("ERROR: End date must be on or after start date.")
         return
 
-    if not os.path.isfile(creds_path):
-        log_fn("ERROR: Credentials JSON not found.")
+    # Creds can come from file OR Streamlit secrets
+    has_file_creds = bool(creds_path and os.path.isfile(creds_path))
+    has_secret_creds = _has_streamlit_secrets_creds()
+    if not has_file_creds and not has_secret_creds:
+        log_fn("ERROR: No credentials found. Upload JSON or set Streamlit secrets [google_service_account].")
         return
 
     try:
-        ws = open_sheet(creds_path, sheet_ref, worksheet_name)
+        ws = open_sheet(creds_path if has_file_creds else "", sheet_ref, worksheet_name)
         log_fn("Connected to Google Sheet.")
     except Exception as e:
         log_fn(f"ERROR opening sheet: {e}")
@@ -684,12 +679,10 @@ def run_scrape_core(
     while curr <= end_date:
         log_fn(f"\n=== {curr.isoformat()} ===")
 
-        # WordPress-based sources
         for idx, (name, api, slug) in enumerate(SOURCES_WP):
             if not include_wp[idx]:
                 continue
             try:
-                # Special case: Newschecker → skip category lookups
                 if name == "Newschecker":
                     cid = None
                 else:
@@ -708,7 +701,6 @@ def run_scrape_core(
             except Exception as e:
                 log_fn(f"  {name}: ERROR {e}")
 
-        # Fact Crescendo
         if include_fc:
             try:
                 posts = fetch_fc_posts(FC_API_BASE, curr)
@@ -717,7 +709,6 @@ def run_scrape_core(
             except Exception as e:
                 log_fn(f"  {FC_SITE_NAME}: ERROR {e}")
 
-        # BoomBD
         if include_boom:
             try:
                 posts = scrape_boombd(curr)
@@ -726,7 +717,6 @@ def run_scrape_core(
             except Exception as e:
                 log_fn(f"  {BOOM_SITE_NAME}: ERROR {e}")
 
-        # Ajker Patrika
         if include_ajk:
             try:
                 posts = scrape_ajker(curr)
@@ -735,7 +725,6 @@ def run_scrape_core(
             except Exception as e:
                 log_fn(f"  {AJK_SITE_NAME}: ERROR {e}")
 
-        # The Dissent — new, HTML-based
         if include_dissent:
             try:
                 posts = dissent_fetch_for_date(curr)
@@ -772,11 +761,9 @@ for a given date range and saves the results into a Google Sheet.
 
     settings = load_settings()
 
-    # ---- Initialize log storage in session_state
     if "logs" not in st.session_state:
         st.session_state.logs = []
 
-    # Sidebar configuration
     st.sidebar.header("Configuration")
 
     today = datetime.date.today()
@@ -807,16 +794,15 @@ for a given date range and saves the results into a Google Sheet.
         value=settings.get("sheet_ref", DEFAULT_SHEET),
     )
 
-    # NEW: worksheet name input
     worksheet_name = st.sidebar.text_input(
         "Worksheet / Tab name",
         value=settings.get("worksheet_name", DEFAULT_WORKSHEET),
     )
 
     st.sidebar.markdown("### Google Service Account JSON")
+    st.sidebar.caption("You can either upload JSON (local) or use Streamlit secrets [google_service_account] (cloud).")
     uploaded_creds = st.sidebar.file_uploader("Upload credentials JSON", type=["json"])
 
-    # If uploaded, store it to CREDS_STORE_PATH so we can reuse later
     if uploaded_creds is not None:
         try:
             content = uploaded_creds.read()
@@ -827,14 +813,12 @@ for a given date range and saves the results into a Google Sheet.
         except Exception as e:
             st.sidebar.error(f"Failed to save credentials: {e}")
 
-    # Fallback to saved path or env var
     creds_path = settings.get("creds_path", "")
     if not creds_path:
         env_creds = os.getenv("GOOGLE_CREDS_JSON")
         if env_creds:
             creds_path = env_creds
 
-    # Sources
     st.sidebar.markdown("### Sources")
     wp_defaults = settings.get("wp_sources", [True] * len(SOURCES_WP))
     wp_states = []
@@ -852,7 +836,7 @@ for a given date range and saves the results into a Google Sheet.
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "sheet_ref": sheet_ref.strip(),
-            "worksheet_name": worksheet_name.strip(),  # NEW
+            "worksheet_name": worksheet_name.strip(),
             "creds_path": CREDS_STORE_PATH if os.path.isfile(CREDS_STORE_PATH) else creds_path,
             "wp_sources": wp_states,
             "enable_fc": enable_fc,
@@ -862,13 +846,9 @@ for a given date range and saves the results into a Google Sheet.
         }
 
     st.markdown("### Run Scraper")
-
     run_button = st.button("Run scraping")
 
-    # Placeholder for live logs (no widget keys → no conflicts)
     log_container = st.empty()
-
-    # Show previous logs (from earlier runs this session)
     if st.session_state.logs:
         log_container.code("\n".join(st.session_state.logs))
 
@@ -882,16 +862,17 @@ for a given date range and saves the results into a Google Sheet.
             return
 
         effective_creds_path = CREDS_STORE_PATH if os.path.isfile(CREDS_STORE_PATH) else creds_path
-        if not effective_creds_path or not os.path.isfile(effective_creds_path):
-            st.error("Please upload credentials JSON first (or set GOOGLE_CREDS_JSON env variable).")
+
+        has_file_creds = bool(effective_creds_path and os.path.isfile(effective_creds_path))
+        has_secret_creds = _has_streamlit_secrets_creds()
+        if not has_file_creds and not has_secret_creds:
+            st.error("No credentials found. Upload JSON or add [google_service_account] to Streamlit secrets.")
             return
 
-        # Save settings
         save_settings(collect_settings_dict())
 
-        # Clear previous logs
         st.session_state.logs = []
-        log_container.code("")  # clear display
+        log_container.code("")
 
         def log_fn(msg: str):
             st.session_state.logs.append(msg)
@@ -902,8 +883,8 @@ for a given date range and saves the results into a Google Sheet.
                 start_date=start_date,
                 end_date=end_date,
                 sheet_ref=sheet_ref.strip(),
-                worksheet_name=worksheet_name.strip(),  # NEW
-                creds_path=effective_creds_path,
+                worksheet_name=worksheet_name.strip(),
+                creds_path=effective_creds_path if has_file_creds else "",
                 include_wp=wp_states,
                 include_fc=enable_fc,
                 include_boom=enable_boom,
@@ -912,7 +893,6 @@ for a given date range and saves the results into a Google Sheet.
                 log_fn=log_fn,
             )
 
-        # Final log display
         log_container.code("\n".join(st.session_state.logs))
         st.success("Finished. Check the log above for details.")
 
