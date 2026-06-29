@@ -2,6 +2,7 @@
 # FC_Article_Scraper.py — Streamlit GUI scraper with settings persistence
 
 import os
+import re
 import json
 import time
 import datetime
@@ -513,8 +514,6 @@ def scrape_boombd(target_date: datetime.date) -> List[Tuple[str, str, str]]:
         time.sleep(0.2)
     return rows
 
-
-import re
 
 AJK_PUBLISH_RE = re.compile(
     r"প্রকাশ\s*:\s*([০-৯]{1,2})\s+([^\s,]+)\s+([০-৯]{4})",
