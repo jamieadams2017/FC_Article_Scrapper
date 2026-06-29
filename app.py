@@ -30,8 +30,8 @@ APP_TITLE = "FC Article Scrapper"
 # =========================
 # Config (edit defaults)
 # =========================
-DEFAULT_SHEET = "Rumor Scanner Scraped Data"
-DEFAULT_WORKSHEET = "collected url"
+DEFAULT_SHEET = "1Y-cE9EIKQESBwHV6cEsz-e9tpJiB8AR-1qTLRFsTkJA"
+DEFAULT_WORKSHEET = "Sheet1"
 
 SOURCES_WP = [
     ("Rumorscanner",        "https://rumorscanner.com/wp-json/wp/v2",          "fact-check"),
