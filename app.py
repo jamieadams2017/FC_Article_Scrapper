@@ -128,6 +128,7 @@ class WPSource:
     category_slug: Optional[str] = None   # None = fetch all posts (no category filter)
     use_html_scraper: bool = False         # fall back to HTML when REST API is blocked
     html_base_url: str = ""
+    connect_timeout: int = 15             # per-source connect timeout in seconds
 
 
 @dataclass
@@ -148,7 +149,7 @@ class DissentSource:
 WP_SOURCES: List[WPSource] = [
     WPSource("Rumorscanner",  "https://rumorscanner.com/wp-json/wp/v2",          "fact-check",
              use_html_scraper=True, html_base_url="https://rumorscanner.com/category/fact-check"),
-    WPSource("Fact-watch",    "https://www.fact-watch.org/wp-json/wp/v2",        "ফ্যাক্টচেক"),
+    WPSource("Fact-watch",    "https://www.fact-watch.org/wp-json/wp/v2",        "ফ্যাক্টচেক",    connect_timeout=8),
     WPSource("Dismislab",     "https://dismislab.com/wp-json/wp/v2",             "factcheck"),
     WPSource("Newschecker",   "https://bangladesh.newschecker.co/wp-json/wp/v2", None),
     WPSource("Factcrescendo", "https://bangladesh.factcrescendo.com/wp-json/wp/v2"),
@@ -331,10 +332,12 @@ def dedupe(
 # ─────────────────────────────────────────
 # WordPress scraper
 # ─────────────────────────────────────────
-def get_category_id(api_base: str, slug: Optional[str]) -> Optional[int]:
+def get_category_id(api_base: str, slug: Optional[str],
+                    timeout: int = 15) -> Optional[int]:
     if not slug:
         return None
-    r = http_get(f"{api_base}/categories", params={"slug": slug, "per_page": 1})
+    r = http_get(f"{api_base}/categories", params={"slug": slug, "per_page": 1},
+                 timeout=timeout)
     try:
         data = r.json()
     except ValueError:
@@ -343,7 +346,8 @@ def get_category_id(api_base: str, slug: Optional[str]) -> Optional[int]:
 
 
 def fetch_wp_posts(api_base: str, cat_id: Optional[int],
-                   target_date: datetime.date) -> List[Tuple[str, str, str]]:
+                   target_date: datetime.date,
+                   timeout: int = 15) -> List[Tuple[str, str, str]]:
     rows: List[Tuple[str, str, str]] = []
     after, before = day_bounds_utc(target_date)
     page = 1
@@ -355,7 +359,7 @@ def fetch_wp_posts(api_base: str, cat_id: Optional[int],
         }
         if cat_id:
             params["categories"] = cat_id
-        r = http_get(f"{api_base}/posts", params=params)
+        r = http_get(f"{api_base}/posts", params=params, timeout=timeout)
         try:
             posts = r.json()
         except ValueError:
@@ -417,6 +421,11 @@ def scrape_html_source(source: HTMLSource,
 
 def _scrape_rumorscanner(base_url: str,
                          target_date: datetime.date) -> List[Tuple[str, str, str]]:
+    # The site uses a WP theme where each card is a bare div containing:
+    #   <h3><a href="...">title</a></h3>
+    #   plain text: "জুন 28, 2026 6:13 অপরাহ্ন"
+    # No <article> tags, no <time> tags — date is plain text after the heading,
+    # so we read the heading's PARENT container to find it.
     rows: List[Tuple[str, str, str]] = []
     seen: set = set()
     page = 1
@@ -430,29 +439,50 @@ def _scrape_rumorscanner(base_url: str,
             break
 
         soup = BeautifulSoup(r.text, "html.parser")
-        articles = soup.find_all("article") or soup.find_all(["h2", "h3"])
-        if not articles:
+
+        # Collect h2/h3 headings that link to article pages (not category pages)
+        headings = [
+            h for h in soup.find_all(["h2", "h3"])
+            if h.find("a", href=True)
+            and "/fact-check/" in (h.find("a", href=True)["href"] or "")
+            and "/category/" not in (h.find("a", href=True)["href"] or "")
+        ]
+        # Future-proof: also try <article> tags
+        if not headings:
+            headings = soup.find_all("article")
+        if not headings:
             break
 
         found_any = False
-        for art in articles:
-            a_tag = art.find("a", href=True)
+        for h in headings:
+            a_tag = h.find("a", href=True)
             if not a_tag:
                 continue
             link = a_tag["href"].strip()
             if not link.startswith("http"):
                 link = "https://rumorscanner.com" + link
-            if any(x in link for x in ("/category/", "/tag/", "/page/")):
-                continue
             if link in seen:
                 continue
             seen.add(link)
 
-            heading = art.find(["h2", "h3", "h4"])
-            title = (heading.get_text(strip=True) if heading else None) \
-                or a_tag.get("title") or a_tag.get_text(strip=True)
+            title = h.get_text(strip=True) or a_tag.get("title") or "(no title)"
 
-            art_date = _parse_date_from_card(art) or _fetch_article_date(link)
+            # Date is in the parent container, not inside the <h3> itself
+            container = h.parent or h
+            art_date = parse_bangla_date(container.get_text(" ", strip=True))
+
+            # Also check for a <time> tag (handles future theme changes)
+            if not art_date:
+                time_tag = container.find("time")
+                if time_tag:
+                    art_date = parse_bangla_date(
+                        time_tag.get("datetime", "") or time_tag.get_text(strip=True)
+                    )
+
+            # Last resort: fetch the article page
+            if not art_date:
+                art_date = _fetch_article_date(link)
+
             if not art_date:
                 continue
             if art_date < target_date:
@@ -742,8 +772,10 @@ def scrape_one_date(
             tasks[src.name] = lambda s=html_src, d=target_date: scrape_html_source(s, d)
         else:
             def _wp_task(src=src, d=target_date):
-                cid = get_category_id(src.api_base, src.category_slug)
-                return fetch_wp_posts(src.api_base, cid, d)
+                cid = get_category_id(src.api_base, src.category_slug,
+                                      timeout=src.connect_timeout)
+                return fetch_wp_posts(src.api_base, cid, d,
+                                      timeout=src.connect_timeout)
             tasks[src.name] = _wp_task
 
     # HTML sources
@@ -767,16 +799,21 @@ def scrape_one_date(
                 posts = future.result()
                 log_fn(f"  {name}: {len(posts)}")
                 rows += [(t, u, d, name) for (t, u, d) in posts]
+            except requests.exceptions.ConnectTimeout:
+                log_fn(f"  {name}: timed out (server unreachable from this host) – skipped")
+                failed.append(name)
+            except requests.exceptions.ConnectionError:
+                log_fn(f"  {name}: connection error (server unreachable) – skipped")
+                failed.append(name)
             except requests.HTTPError as e:
                 resp = e.response
-                if name == "Newschecker" and resp is not None \
-                        and resp.status_code in (403, 503):
-                    log_fn(f"  {name}: blocked by Cloudflare – skipped")
+                if resp is not None and resp.status_code in (403, 503):
+                    log_fn(f"  {name}: blocked (HTTP {resp.status_code}) – skipped")
                 else:
-                    log_fn(f"  {name}: HTTP ERROR {e}")
+                    log_fn(f"  {name}: HTTP ERROR {e.response.status_code if e.response else e}")
                 failed.append(name)
             except Exception as e:
-                log_fn(f"  {name}: ERROR {e}")
+                log_fn(f"  {name}: ERROR {type(e).__name__}: {e}")
                 failed.append(name)
 
     return rows, failed
