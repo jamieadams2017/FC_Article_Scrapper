@@ -121,12 +121,6 @@ SESSION = make_session()
 
 def http_get(url: str, **kw) -> requests.Response:
     kw.setdefault("timeout", 15)
-    # Some sites (e.g. Rumorscanner) return 403 without a matching Referer
-    if "rumorscanner.com" in url:
-        headers = kw.pop("headers", {})
-        headers.setdefault("Referer", "https://rumorscanner.com/")
-        headers.setdefault("Origin", "https://rumorscanner.com")
-        kw["headers"] = headers
     r = SESSION.get(url, **kw)
     r.raise_for_status()
     return r
@@ -297,6 +291,155 @@ def fetch_fc_posts(api_base: str, target_date: datetime.date) -> List[Tuple[str,
             break
         page += 1
         time.sleep(0.2)
+    return rows
+
+
+# =========================
+# Rumorscanner HTML scraper (WP REST API is blocked)
+# =========================
+RS_BASE = "https://rumorscanner.com/category/fact-check"
+
+# Bangla month names used on rumorscanner.com
+_RS_BN_MONTHS = {
+    "জানুয়ারি": 1, "জানুয়ারী": 1,
+    "ফেব্রুয়ারি": 2, "ফেব্রুয়ারী": 2,
+    "মার্চ": 3,
+    "এপ্রিল": 4,
+    "মে": 5,
+    "জুন": 6,
+    "জুলাই": 7,
+    "আগস্ট": 8,
+    "সেপ্টেম্বর": 9,
+    "অক্টোবর": 10,
+    "নভেম্বর": 11,
+    "ডিসেম্বর": 12,
+}
+_RS_BN_DIGITS = {"০":"0","১":"1","২":"2","৩":"3","৪":"4",
+                 "৫":"5","৬":"6","৭":"7","৮":"8","৯":"9"}
+_RS_DATE_RE = re.compile(
+    r"([০-৯]{1,2})\s+([^\s,،]+)\s*,?\s*([০-৯]{4})", re.UNICODE
+)
+
+
+def _rs_bn_to_int(s: str) -> int:
+    return int("".join(_RS_BN_DIGITS.get(ch, ch) for ch in str(s)))
+
+
+def _rs_parse_date(text: str) -> Optional[datetime.date]:
+    """Parse a Bangla date string like '২৯ জুন, ২০২৬' into a date object.
+    Also handles ISO datetime strings (from <time datetime='…'> attributes)."""
+    if not text:
+        return None
+    text = text.strip()
+    # ISO format from datetime attribute: 2026-06-29T... or 2026-06-29
+    if re.match(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            return datetime.date.fromisoformat(text[:10])
+        except ValueError:
+            pass
+    # Bangla script date
+    m = _RS_DATE_RE.search(text)
+    if not m:
+        return None
+    month = _RS_BN_MONTHS.get(m.group(2).strip())
+    if not month:
+        return None
+    try:
+        return datetime.date(_rs_bn_to_int(m.group(3)), month, _rs_bn_to_int(m.group(1)))
+    except Exception:
+        return None
+
+
+def scrape_rumorscanner(target_date: datetime.date) -> List[Tuple[str, str, str]]:
+    """HTML scraper for rumorscanner.com/category/fact-check (WP REST API blocked)."""
+    rows: List[Tuple[str, str, str]] = []
+    seen: set = set()
+    page = 1
+    stop = False
+
+    while not stop:
+        url = RS_BASE if page == 1 else f"{RS_BASE}/page/{page}/"
+        try:
+            r = http_get(url)
+        except Exception:
+            break
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Articles are in <article> tags; fall back to any <h2>/<h3> with links
+        articles = soup.find_all("article")
+        if not articles:
+            # Fallback: collect all internal post links
+            articles = soup.find_all(["h2", "h3"])
+        if not articles:
+            break
+
+        found_any = False
+        for art in articles:
+            # --- extract link + title ---
+            a_tag = art.find("a", href=True)
+            if not a_tag:
+                continue
+            link = a_tag["href"].strip()
+            if not link.startswith("http"):
+                link = "https://rumorscanner.com" + link
+            # Skip category/tag/page links
+            if "/category/" in link or "/tag/" in link or "/page/" in link:
+                continue
+            if link in seen:
+                continue
+            seen.add(link)
+
+            title = a_tag.get("title") or a_tag.get_text(strip=True)
+            # Prefer the heading text if available
+            heading = art.find(["h2", "h3", "h4"])
+            if heading:
+                title = heading.get_text(strip=True) or title
+
+            # --- extract date ---
+            art_date: Optional[datetime.date] = None
+
+            # 1. <time datetime="…">
+            time_tag = art.find("time")
+            if time_tag:
+                art_date = _rs_parse_date(time_tag.get("datetime", "") or time_tag.get_text(strip=True))
+
+            # 2. Look for a Bangla date string anywhere in the article card
+            if not art_date:
+                art_date = _rs_parse_date(art.get_text(" ", strip=True))
+
+            # 3. Fetch the article page as last resort
+            if not art_date:
+                try:
+                    pr = http_get(link)
+                    ps = BeautifulSoup(pr.text, "html.parser")
+                    t = ps.find("time", attrs={"datetime": True}) or ps.find("time")
+                    if t:
+                        art_date = _rs_parse_date(t.get("datetime", "") or t.get_text(strip=True))
+                    if not art_date:
+                        art_date = _rs_parse_date(ps.get_text(" ", strip=True))
+                except Exception:
+                    pass
+
+            if not art_date:
+                continue
+
+            if art_date < target_date:
+                stop = True
+                break
+
+            if art_date == target_date:
+                if title and link:
+                    rows.append((title, link, art_date.isoformat()))
+                    found_any = True
+
+        if stop:
+            break
+        if not found_any and page > 3:
+            break
+        page += 1
+        time.sleep(0.3)
+
     return rows
 
 
@@ -689,6 +832,13 @@ def run_scrape_core(
             if not include_wp[idx]:
                 continue
             try:
+                # Rumorscanner blocks the WP REST API externally; use HTML scraper instead
+                if name == "Rumorscanner":
+                    posts = scrape_rumorscanner(curr)
+                    log_fn(f"  {name}: {len(posts)}")
+                    all_rows += [(t, u, d, name) for (t, u, d) in posts]
+                    continue
+
                 if name == "Newschecker":
                     cid = None
                 else:
