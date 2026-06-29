@@ -614,12 +614,54 @@ def _dissent_extract_date(soup: BeautifulSoup) -> Optional[datetime.date]:
     return parse_bangla_date(soup.get_text(" ", strip=True))
 
 
+def _dissent_date_from_attrs(attrs: dict) -> Optional[datetime.date]:
+    """Extract date directly from API attributes without fetching the article page."""
+    for field in ("published-at", "publishedAt", "created-at", "createdAt",
+                  "updated-at", "updatedAt", "date"):
+        val = attrs.get(field)
+        if val:
+            d = parse_bangla_date(str(val))
+            if d:
+                return d
+            try:
+                return datetime.date.fromisoformat(str(val)[:10])
+            except Exception:
+                pass
+    return None
+
+
+def _dissent_fetch_article(url: str) -> Tuple[Optional[datetime.date], Optional[str]]:
+    """Fetch one Dissent article page and return (date, title)."""
+    try:
+        html = SESSION.get(
+            url,
+            headers={"Accept": "text/html,*/*",
+                     "User-Agent": SESSION.headers.get("User-Agent", "")},
+            timeout=15,
+        ).text
+        soup = BeautifulSoup(html, "html.parser")
+        return _dissent_extract_date(soup), _dissent_extract_title(soup)
+    except Exception:
+        return None, None
+
+
 def scrape_dissent(source: DissentSource,
                    target_date: datetime.date) -> List[Tuple[str, str, str]]:
+    """
+    Scrape The Dissent for articles on target_date.
+
+    Strategy:
+      1. Page through the API (newest-first).
+      2. Try to get the date from API attributes directly (no article fetch needed).
+      3. Items with no API date are queued for parallel article page fetches.
+      4. Stop paging as soon as an article older than target_date is seen.
+    """
     results: List[Tuple[str, str, str]] = []
+    needs_fetch: List[Tuple[str, str]] = []
+    stop = False
     page = 1
 
-    while page <= 50:
+    while page <= 50 and not stop:
         try:
             r = SESSION.get(
                 source.api_base,
@@ -643,27 +685,38 @@ def scrape_dissent(source: DissentSource,
             slug = attrs.get("slug")
             if not slug:
                 continue
-            url = f"{source.article_base}/{slug}"
-            try:
-                html = SESSION.get(
-                    url,
-                    headers={"Accept": "text/html,*/*",
-                             "User-Agent": SESSION.headers.get("User-Agent", "")},
-                    timeout=15,
-                ).text
-            except Exception:
-                continue
 
-            soup = BeautifulSoup(html, "html.parser")
-            art_date = _dissent_extract_date(soup)
-            if not art_date or art_date != target_date:
-                continue
-            title = _dissent_extract_title(soup) or attrs.get("title") or "(no title)"
-            results.append((title, url, art_date.isoformat()))
+            url = f"{source.article_base}/{slug}"
+            api_title = attrs.get("title") or "(no title)"
+
+            # Fast path: date from API attributes (no HTTP request needed)
+            art_date = _dissent_date_from_attrs(attrs)
+
+            if art_date is not None:
+                if art_date < target_date:
+                    stop = True  # API is newest-first; nothing older will match
+                    break
+                if art_date == target_date:
+                    results.append((api_title, url, art_date.isoformat()))
+            else:
+                # Date unknown from API — queue for parallel article fetch
+                needs_fetch.append((url, api_title))
 
         page += 1
 
+    # Parallel fetch for items whose date wasn't in the API response
+    if needs_fetch:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            future_map = {ex.submit(_dissent_fetch_article, url): (url, api_title)
+                          for url, api_title in needs_fetch}
+            for future in as_completed(future_map):
+                url, api_title = future_map[future]
+                art_date, page_title = future.result()
+                if art_date and art_date == target_date:
+                    results.append((page_title or api_title, url, art_date.isoformat()))
+
     return results
+
 
 
 # ─────────────────────────────────────────
