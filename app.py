@@ -121,6 +121,12 @@ SESSION = make_session()
 
 def http_get(url: str, **kw) -> requests.Response:
     kw.setdefault("timeout", 15)
+    # Some sites (e.g. Rumorscanner) return 403 without a matching Referer
+    if "rumorscanner.com" in url:
+        headers = kw.pop("headers", {})
+        headers.setdefault("Referer", "https://rumorscanner.com/")
+        headers.setdefault("Origin", "https://rumorscanner.com")
+        kw["headers"] = headers
     r = SESSION.get(url, **kw)
     r.raise_for_status()
     return r
